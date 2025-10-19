@@ -1,248 +1,420 @@
-import os, re, argparse, tempfile, math, random
-from moviepy.video.fx import all as vfx # 추가 코드
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+shotsmaker main.py (single-file, stable)
+- inputs/ 내 이미지들을 이어붙여 세로형(1080x1920) 쇼츠 영상 생성
+- Ken Burns(느린 줌) 효과
+- 자막: script.txt(줄 단위)를 자동 읽어 문장별 자막 구성 (없으면 --caption 한 줄 사용)
+- 오디오: --audio 파일 사용, 없으면 script/caption으로 gTTS 자동 생성(옵션)
+- QuickTime/웹 호환: yuv420p + +faststart
+- MoviePy 1.0.3/Pillow 9.5.0 호환 (TextClip 인자명: txt)
+
+예시:
+    python main.py --in inputs --out outputs --duration 5
+    python main.py --in inputs --out outputs --duration 5 --caption "비행기 창문 아래 구멍의 비밀"
+    python main.py --in inputs --out outputs --duration 5 --script inputs/script.txt
+    python main.py --in inputs --out outputs --duration 5 --script inputs/script.txt --tts_lang ko
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import argparse
+import random
 from pathlib import Path
+from typing import List, Tuple, Optional
 
-# === Config ===
-USE_OFFLINE_TTS = False  # 오프라인 TTS로 바꾸려면 True로 바꾸고 pyttsx3 설치
-FONT_SIZE = 54
-CAPTION_MARGIN = 60
-CAPTION_COLOR = 'white'
-CAPTION_STROKE_COLOR = 'black'
-CAPTION_STROKE_WIDTH = 2
-RESOLUTION = (1080, 1920)  # 9:16
-FPS = 30
-BGM_DB = -18  # 배경음 볼륨(dB) 대략적 감쇠
-
-# === Imports (lazy) ===
+# MoviePy
 from moviepy.editor import (
-    AudioFileClip, ImageClip, TextClip, CompositeAudioClip,
-    CompositeVideoClip, concatenate_videoclips, ColorClip, afx
+    ImageClip,
+    ColorClip,
+    CompositeVideoClip,
+    TextClip,
+    concatenate_videoclips,
+    AudioFileClip,
 )
-from moviepy.audio.AudioClip import AudioArrayClip
-import numpy as np
 
-def read_text(p: Path) -> str:
-    return p.read_text(encoding='utf-8').strip()
+# -----------------------------
+# macOS 편의: 외부 도구 경로 힌트
+# -----------------------------
+if sys.platform == "darwin":
+    os.environ.setdefault("IMAGEMAGICK_BINARY", "/opt/homebrew/bin/magick")
+    os.environ.setdefault("IMAGEIO_FFMPEG_EXE", "/opt/homebrew/bin/ffmpeg")
 
-def split_sentences_ko(text: str):
-    # 마침표/물음표/느낌표 기준 단순 분리
-    parts = re.split(r'(?<=[\.!\?…]|[다요죠고임음읍니까]|\))\s+', text)
-    parts = [s.strip() for s in parts if s.strip()]
-    return parts
+# -----------------------------
+# 기본 설정
+# -----------------------------
+RESOLUTION: Tuple[int, int] = (1080, 1920)  # 세로 캔버스
+FPS: int = 30
+BG_COLOR: Tuple[int, int, int] = (0, 0, 0)
+KB_ZOOM_RANGE: Tuple[float, float] = (1.06, 1.16)  # 6~16% 줌 범위
 
-def tts_gtts(text: str, lang: str, outfile: Path):
-    from gtts import gTTS
-    tts = gTTS(text=text, lang=lang)
-    tts.save(str(outfile))
-    return outfile
+# macOS / Windows 한글 폰트 후보
+MAC_FONT_CANDIDATES: List[str] = [
+    "/Library/Fonts/NanumGothic.ttf",
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+]
+WIN_FONT_CANDIDATES: List[str] = [
+    "C:/Windows/Fonts/malgun.ttf",
+    "C:/Windows/Fonts/malgunbd.ttf",
+]
 
-def tts_offline_pyttsx3(text: str, outfile: Path):
-    # 오프라인: 기기 TTS 음색/속도 품질은 OS마다 달라짐
-    import pyttsx3
-    engine = pyttsx3.init()
-    # 속도/톤 약간 조정 가능
-    # engine.setProperty('rate', 180)  # 말속도
-    # engine.setProperty('volume', 0.9)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp_name = tmp.name
-    engine.save_to_file(text, tmp_name)
-    engine.runAndWait()
-    # WAV -> MP3 변환은 생략 가능(moviepy가 wav도 읽음)
-    os.replace(tmp_name, outfile)
-    return outfile
 
-def softwrap(text: str, width=18):
-    # 아주 단순 줄바꿈(자막 너무 길지 않게)
-    words = re.split(r'(\s+)', text)
-    lines, line = [], ""
-    for w in words:
-        if len(line + w) > width and line:
-            lines.append(line.strip())
-            line = w.strip()
-        else:
-            line += w
-    if line.strip():
-        lines.append(line.strip())
-    return "\n".join(lines)
+def pick_font_path() -> Optional[str]:
+    """사용 가능한 한글 폰트를 찾아 경로 반환. 없으면 None."""
+    candidates = MAC_FONT_CANDIDATES if sys.platform == "darwin" else WIN_FONT_CANDIDATES
+    for p in candidates:
+        if Path(p).exists():
+            return p
+    return None
 
-def make_caption_clip(sentence, duration, fontsize=FONT_SIZE):
-    # 자막 TextClip 생성
-    txt = softwrap(sentence, width=20)
-    tc = TextClip(
-        txt,
-        fontsize=fontsize,
-        color=CAPTION_COLOR,
-        font="Arial-Unicode-MS",  # 시스템에 따라 변경 필요(한글 지원 폰트)
-        stroke_color=CAPTION_STROKE_COLOR,
-        stroke_width=CAPTION_STROKE_WIDTH,
-        method='caption',
-        size=(RESOLUTION[0]-100, None)
-    )
-    # 화면 하단에 배치
-    def pos(t):
-        return ('center', RESOLUTION[1] - CAPTION_MARGIN - tc.h/2)
-    return tc.set_position(pos).set_duration(duration)
 
-'''
-def ken_burns_for_image(img_path: Path, segment_duration: float):
-    # 이미지에 간단한 패닝/줌 적용
-    clip = ImageClip(str(img_path)).resize(height=RESOLUTION[1])
-    # 세로 맞추고 가로 비율에 따라 좌우 크롭
-    if clip.w < RESOLUTION[0]:
-        # 세로 기준으로 늘렸더니 가로가 부족하면 가로 채우기
-        clip = clip.resize(width=RESOLUTION[0])
-    clip = clip.set_duration(segment_duration)
+# -----------------------------
+# IO 유틸
+# -----------------------------
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
-    # 시작/끝 스케일, x이동 랜덤
-    start_scale = random.uniform(1.02, 1.08)
-    end_scale   = random.uniform(1.10, 1.18)
-    start_x     = random.uniform(-40, 40)
-    end_x       = random.uniform(-80, 80)
 
-    def make_frame(t):
-        prog = t / max(segment_duration, 0.0001)
-        scale = start_scale + (end_scale - start_scale) * prog
-        x = start_x + (end_x - start_x) * prog
-        frame = clip.get_frame(t)
-        frame_clip = ImageClip(frame).resize(scale)
-        # 중앙 정렬 + x 오프셋
-        x_center = (RESOLUTION[0] - frame_clip.w) / 2 + x
-        y_center = (RESOLUTION[1] - frame_clip.h) / 2
-        bg = ColorClip(RESOLUTION, color=(0,0,0)).set_duration(clip.duration)
-        return CompositeVideoClip(
-            [bg, frame_clip.set_position((x_center, y_center))]
-        ).get_frame(0)
+def scan_images(in_dir: Path) -> List[Path]:
+    """입력 폴더(하위 포함)에서 이미지 파일 재귀 검색."""
+    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
+    files = [p for p in in_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+    files.sort()
+    return files
 
-    return clip.fl(make_frame, apply_to=[])
-'''
 
-def ken_burns_for_image(img_path, segment_duration: float):
-    # 기본 이미지 클립
-    base = ImageClip(str(img_path)).set_duration(segment_duration)
+def load_script_lines(in_dir: Path, script_arg: Optional[str]) -> List[str]:
+    """
+    대본 파일을 줄 단위로 읽어 리스트 반환.
+    우선순위: --script 경로 > {in_dir}/script.txt
+    빈 줄 제거, 양끝 공백 제거.
+    """
+    target: Optional[Path] = None
+    if script_arg:
+        p = Path(script_arg)
+        if p.exists():
+            target = p
+    else:
+        p = in_dir / "script.txt"
+        if p.exists():
+            target = p
 
-    # 화면(1080x1920) 꽉 채우기 위한 최소 스케일
+    if not target:
+        return []
+
+    lines: List[str] = []
+    with open(target, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s:
+                lines.append(s)
+    return lines
+
+
+# -----------------------------
+# 영상 효과
+# -----------------------------
+def ken_burns_for_image(
+    img_path: Path,
+    segment_duration: float,
+    resolution: Tuple[int, int],
+    bg_color: Tuple[int, int, int],
+    zoom_range: Tuple[float, float] = KB_ZOOM_RANGE,
+) -> CompositeVideoClip:
+    """이미지 1장을 segment_duration 길이의 줌/팬 클립으로 변환."""
+    base = ImageClip(str(img_path)).set_duration(max(0.01, float(segment_duration)))
     w0, h0 = base.size
-    sx = RESOLUTION[0] / w0
-    sy = RESOLUTION[1] / h0
-    fill = max(sx, sy)
+    W, H = resolution
 
-    # 랜덤 줌 범위 (부드러운 Ken Burns)
-    start_scale = random.uniform(1.02, 1.08)
-    end_scale   = random.uniform(1.10, 1.18)
+    # 캔버스 채우기 위한 최소 스케일
+    sx, sy = W / w0, H / h0
+    fill_scale = max(sx, sy)
 
-    # 시간 t에 따른 스케일
-    def scale_at(t):
-        p = 0 if segment_duration <= 0 else (t / segment_duration)
-        return fill * (start_scale + (end_scale - start_scale) * p)
+    zmin, zmax = zoom_range
+    start_scale = random.uniform(zmin, (zmin + zmax) / 2.0)
+    end_scale = random.uniform((zmin + zmax) / 2.0, zmax)
 
-    # 시간에 따라 크기 변화
+    def scale_at(t: float) -> float:
+        p = 0.0 if segment_duration <= 0 else min(max(t / segment_duration, 0.0), 1.0)
+        return fill_scale * (start_scale + (end_scale - start_scale) * p)
+
     zoomed = base.resize(lambda t: scale_at(t))
 
-    # 검정 배경 위에 중앙 정렬로 합성 (크롭 대신)
-    bg = ColorClip(RESOLUTION, color=(0, 0, 0)).set_duration(segment_duration)
-    comp = CompositeVideoClip(
-        [bg, zoomed.set_position('center')],
-        size=RESOLUTION
-    ).set_duration(segment_duration)
+    # 배경 + 중앙 정렬
+    bg = ColorClip(resolution, color=bg_color).set_duration(segment_duration)
+    clip = CompositeVideoClip([bg, zoomed.set_position("center")], size=resolution)
+    return clip.set_duration(segment_duration)
 
-    return comp
 
-def mix_bgm(narration: AudioFileClip, bgm_path: Path = None):
-    if not bgm_path or not bgm_path.exists():
-        return narration
-    bgm = AudioFileClip(str(bgm_path)).volumex(1.0)
-    # 길이 맞추고 볼륨 감쇠
-    bgm = afx.audio_loop(bgm, duration=narration.duration).volumex(10 ** (BGM_DB / 20.0))
-    return CompositeAudioClip([bgm, narration]).set_duration(narration.duration)
+# -----------------------------
+# 자막
+# -----------------------------
+def make_caption_clip(
+    text: str,
+    duration: float,
+    resolution: Tuple[int, int],
+    font_path: Optional[str],
+    fontsize: int = 56,
+    color: Tuple[int, int, int] = (255, 255, 255),
+    stroke_width: int = 2,
+    stroke_color: Tuple[int, int, int] = (0, 0, 0),
+    margin_bottom: int = 120,
+) -> TextClip:
+    """한 줄 자막 클립 (moviepy 1.0.3 → TextClip 인자명은 txt)."""
+    color_str = f"rgb({color[0]},{color[1]},{color[2]})"
+    stroke_str = f"rgb({stroke_color[0]},{stroke_color[1]},{stroke_color[2]})"
 
-def estimate_read_speed(text: str):
-    # 한국어 대략 6~9글자/초 정도 읽는다고 가정, 평균치로 대충 길이 산정
-    chars = len(re.sub(r'\s+', '', text))
-    sec = max(3, chars / 7.5)
-    return sec
+    base_kwargs = dict(
+        txt=text,                 # 핵심: 'text'가 아니라 'txt'
+        fontsize=fontsize,
+        color=color_str,
+        stroke_color=stroke_str,
+        stroke_width=stroke_width,
+    )
+    if font_path:
+        base_kwargs["font"] = font_path
 
-def main():
+    # caption 방식(자동 줄바꿈) → 실패 시 label 폴백
+    try:
+        tc = TextClip(
+            **base_kwargs,
+            method="caption",
+            size=(resolution[0] - 100, None),
+        ).set_duration(max(0.01, float(duration)))
+    except Exception:
+        safe = text
+        if len(safe) > 40:
+            parts = [safe[i:i + 40] for i in range(0, len(safe), 40)]
+            safe = "\n".join(parts)
+        fb = dict(base_kwargs)
+        fb["txt"] = safe
+        tc = TextClip(**fb, method="label").set_duration(max(0.01, float(duration)))
+
+    return tc.set_position(("center", resolution[1] - margin_bottom))
+
+
+def make_caption_sequence(
+    lines: List[str],
+    total_duration: float,
+    resolution: Tuple[int, int],
+    font_path: Optional[str],
+) -> List[TextClip]:
+    """
+    대본 줄 별로 자막 클립을 만들고 total_duration 내에서 순차 배치.
+    기본 시간: 글자수*0.06초(최소 1.2초) → 전체 길이에 맞춰 비율 스케일.
+    """
+    if not lines:
+        return []
+
+    raw_durs = [max(1.2, len(line) * 0.06) for line in lines]
+    sum_raw = sum(raw_durs)
+    factor = total_duration / sum_raw if sum_raw > 0 else 1.0
+    durs = [max(0.8, rd * factor) for rd in raw_durs]
+
+    # 누적 시작 시각
+    starts, acc = [], 0.0
+    for d in durs:
+        starts.append(acc)
+        acc += d
+
+    # 마지막 조정
+    if acc > 0 and abs(acc - total_duration) > 0.25:
+        scale = total_duration / acc
+        durs = [d * scale for d in durs]
+        starts, acc = [], 0.0
+        for d in durs:
+            starts.append(acc)
+            acc += d
+
+    color_str = "rgb(255,255,255)"
+    stroke_str = "rgb(0,0,0)"
+    seq: List[TextClip] = []
+
+    for line, st, du in zip(lines, starts, durs):
+        kwargs = dict(
+            txt=line,
+            fontsize=56,
+            color=color_str,
+            stroke_color=stroke_str,
+            stroke_width=2,
+            method="caption",
+            size=(resolution[0] - 100, None),
+        )
+        if font_path:
+            kwargs["font"] = font_path
+
+        try:
+            tc = TextClip(**kwargs).set_duration(du)
+        except Exception:
+            safe = line
+            if len(safe) > 40:
+                parts = [safe[i:i + 40] for i in range(0, len(safe), 40)]
+                safe = "\n".join(parts)
+            kw = dict(kwargs)
+            kw["txt"] = safe
+            kw.pop("size", None)
+            kw["method"] = "label"
+            tc = TextClip(**kw).set_duration(du)
+
+        tc = tc.set_position(("center", RESOLUTION[1] - 120)).set_start(st)
+        seq.append(tc)
+
+    return seq
+
+
+# -----------------------------
+# 최종 합성 / 출력
+# -----------------------------
+def build_final_video(
+    images: List[Path],
+    per_image_sec: float,
+    caption_text: Optional[str],
+    audio_path: Optional[Path],
+    script_lines: Optional[List[str]] = None,
+) -> CompositeVideoClip:
+    """이미지 → 클립 → 연결, 자막/오디오 적용."""
+    if not images:
+        raise SystemExit("❌ inputs 폴더에 사용할 이미지가 없습니다.")
+
+    clips = [
+        ken_burns_for_image(
+            img_path=img,
+            segment_duration=per_image_sec,
+            resolution=RESOLUTION,
+            bg_color=BG_COLOR,
+            zoom_range=KB_ZOOM_RANGE,
+        )
+        for img in images
+    ]
+    video = concatenate_videoclips(clips, method="compose")
+
+    # 자막: script_lines 우선, 없으면 caption_text(한 줄)
+    if script_lines and len(script_lines) > 0:
+        font_path = pick_font_path()
+        seq = make_caption_sequence(
+            lines=script_lines,
+            total_duration=video.duration,
+            resolution=RESOLUTION,
+            font_path=font_path,
+        )
+        if seq:
+            video = CompositeVideoClip([video, *seq], size=RESOLUTION)
+    elif caption_text:
+        font_path = pick_font_path()
+        cap = make_caption_clip(
+            text=caption_text,
+            duration=video.duration,
+            resolution=RESOLUTION,
+            font_path=font_path,
+            fontsize=56,
+            color=(255, 255, 255),
+            stroke_width=2,
+            stroke_color=(0, 0, 0),
+            margin_bottom=120,
+        )
+        video = CompositeVideoClip([video, cap], size=RESOLUTION)
+
+    # 오디오
+    if audio_path and audio_path.exists():
+        try:
+            ac = AudioFileClip(str(audio_path))
+            video = video.set_audio(ac)
+        except Exception as e:
+            print(f"⚠️ 오디오를 불러오지 못했습니다: {e}")
+
+    return video.set_fps(FPS)
+
+
+def write_video_safe(clip: CompositeVideoClip, out_path: Path) -> None:
+    """재생 호환을 위한 안전한 인코딩 옵션 고정."""
+    ensure_dir(out_path.parent)
+    if not clip.duration or clip.duration <= 0:
+        raise SystemExit("❌ 최종 클립 길이가 0초입니다. --duration(장당 길이)을 확인하세요.")
+
+    print(f"\n➡️  최종 길이: {clip.duration:.2f}s, FPS: {FPS}, 출력: {out_path}\n")
+
+    clip.write_videofile(
+        str(out_path),
+        fps=FPS,
+        codec="libx264",
+        audio_codec="aac",
+        bitrate="4000k",
+        ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        threads=max(1, (os.cpu_count() or 8) - 1),
+        verbose=True,
+        logger="bar",  # 진행바 표시 ("print"/None 도 가능)
+    )
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument('--in', dest='in_dir', required=True, help='inputs 폴더 경로')
-    ap.add_argument('--out', dest='out_dir', required=True, help='outputs 폴더 경로')
-    ap.add_argument('--tts_lang', default='ko', help='gTTS 언어코드 (ko, en 등)')
-    ap.add_argument('--duration', type=int, default=45, help='목표 영상 길이(초)')
+    ap.add_argument("--in", dest="in_dir", default="inputs", help="입력 이미지 폴더 경로")
+    ap.add_argument("--out", dest="out_dir", default="outputs", help="출력 폴더 경로")
+    ap.add_argument("--tts-lang", "--tts_lang", dest="tts_lang", default="ko", help="TTS 언어 코드 (예: ko, en)")
+    ap.add_argument("--duration", type=float, default=3.0, help="이미지 1장당 지속 시간(초)")
+    ap.add_argument("--caption", type=str, default=None, help="(옵션) 전체 구간 한 줄 자막")
+    ap.add_argument("--audio", type=str, default=None, help="(옵션) 오디오 파일 경로(mp3/wav)")
+    ap.add_argument("--script", type=str, default=None, help="(옵션) 대본 파일 경로(미지정시 inputs/script.txt 시도)")
+    return ap
+
+
+def main() -> None:
+    from gtts import gTTS
+    import tempfile
+
+    # 1) 인자
+    ap = build_arg_parser()
     args = ap.parse_args()
 
+    # 2) 경로
     in_dir = Path(args.in_dir)
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "output.mp4"
 
-    title = read_text(in_dir/'title.txt') if (in_dir/'title.txt').exists() else "Untitled Shorts"
-    script = read_text(in_dir/'script.txt')
-    sentences = split_sentences_ko(script)
+    if not in_dir.exists():
+        raise SystemExit(f"❌ 입력 폴더가 존재하지 않습니다: {in_dir}")
 
-    # 문장별 길이 대략 분배 (총합이 목표 duration 근처가 되도록)
-    ests = [estimate_read_speed(s) for s in sentences]
-    scale = args.duration / max(sum(ests), 1e-6)
-    seg_durs = [max(2.0, d * scale) for d in ests]  # 최소 2초
-
-    # TTS 생성
-    tts_file = out_dir / 'narration.mp3'
-    if USE_OFFLINE_TTS:
-        tts_offline_pyttsx3(script, tts_file.with_suffix('.wav'))
-        n_clip = AudioFileClip(str(tts_file.with_suffix('.wav')))
-    else:
-        tts_gtts(script, args.tts_lang, tts_file)
-        n_clip = AudioFileClip(str(tts_file))
-
-    # 이미지 로드(없으면 검정 배경)
-    img_dir = in_dir/'images'
-    images = sorted([p for p in img_dir.glob('*') if p.suffix.lower() in ['.jpg','.jpeg','.png']])
+    # 3) 이미지 스캔
+    images = scan_images(in_dir)
     if not images:
-        images = None
+        raise SystemExit(f"❌ 이미지가 없습니다: {in_dir} (예: {in_dir}/image.png 또는 하위 폴더)")
 
-    # 문장별 비디오 조각 만들기
-    clips = []
-    img_idx = 0
-    for sent, dur in zip(sentences, seg_durs):
-        if images:
-            img_path = images[img_idx % len(images)]
-            v = ken_burns_for_image(img_path, dur)
-            img_idx += 1
-        else:
-            v = ColorClip(RESOLUTION, color=(0,0,0), duration=dur)
+    # 4) 스크립트/옵션
+    per_image_sec = max(0.1, float(args.duration))
+    caption_text = args.caption
+    script_lines = load_script_lines(in_dir, args.script)
+    audio_path = Path(args.audio) if args.audio else None
 
-        cap = make_caption_clip(sent, dur)
-        clips.append(CompositeVideoClip([v, cap]).set_duration(dur))
+    # 5) 자동 TTS: 오디오 없고 스크립트 or 캡션 있으면 생성
+    if audio_path is None and (script_lines or caption_text):
+        try:
+            tmpdir = Path(tempfile.gettempdir())
+            tts_path = tmpdir / "shotsmaker_tts.mp3"
+            tts_text = " ".join(script_lines) if script_lines else caption_text
+            tts = gTTS(text=tts_text, lang=(args.tts_lang or "ko"))
+            tts.save(str(tts_path))
+            audio_path = tts_path
+            print(f"🔊 TTS 생성 완료 → {tts_path}")
+        except Exception as e:
+            print(f"⚠️ TTS 생성 실패: {e} (무음으로 진행)")
 
-    video = concatenate_videoclips(clips, method='compose')
-    # 오디오: 내레이션 길이에 맞춰 잘라내기(문장 타이밍 정교화는 심플 버전)
-    # 심플하게 전체 스크립트 TTS를 통짜로 쓰되, 영상 길이에 맞춤
-    total_vdur = video.duration
-    n_final = n_clip
-    if n_clip.duration > total_vdur:
-        n_final = n_clip.subclip(0, total_vdur)
-    elif n_clip.duration < total_vdur:
-        # 끝부분 약간의 무음 패드
-        pad = total_vdur - n_clip.duration
-        silence = AudioArrayClip(np.zeros((int(pad*44100), 2)), fps=44100)
-        n_final = concatenate_videoclips([], method="compose")  # dummy
-        n_final = CompositeAudioClip([AudioFileClip(str(tts_file)) , silence.set_start(n_clip.duration)]).set_duration(total_vdur)
-
-    # BGM 믹스
-    bgm_path = in_dir/'bgm.mp3'
-    final_audio = mix_bgm(n_final, bgm_path if bgm_path.exists() else None)
-
-    final = video.set_audio(final_audio).set_fps(FPS)
-    safe_title = re.sub(r'[^0-9a-zA-Z가-힣_\-]+', '_', title)[:60]
-    outfile = out_dir / f"{safe_title}_shorts.mp4"
-
-    final.write_videofile(
-        str(outfile),
-        fps=FPS,
-        codec='libx264',
-        audio_codec='aac',
-        bitrate='5000k',
-        threads=4,
-        preset='medium'
+    # 6) 합성 & 저장
+    final_clip = build_final_video(
+        images=images,
+        per_image_sec=per_image_sec,
+        caption_text=caption_text,
+        audio_path=audio_path,
+        script_lines=script_lines,
     )
-    print(f"✅ Saved: {outfile}")
+    write_video_safe(final_clip, out_path)
+    print("\n✅ 완료! 재생이 안 되면 VLC로도 테스트해 보세요 (QuickTime 문제일 수 있음).\n")
+
 
 if __name__ == "__main__":
     main()
