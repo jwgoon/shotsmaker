@@ -1,16 +1,68 @@
-# Python cache
+# ----------------------------
+# Python build & cache files
+# ----------------------------
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# Virtual env
+# Virtual environments
 .venv/
-.env
+.env/
+venv/
 
-# macOS
+# Package / build artifacts
+build/
+dist/
+*.egg-info/
+
+# ----------------------------
+# macOS / System files
+# ----------------------------
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
 
-# Outputs
+# ----------------------------
+# IDE / Editor configs
+# ----------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ----------------------------
+# Output & generated media
+# ----------------------------
 outputs/
 *.mp4
-*.wav
 *.mp3
+*.wav
+
+# ----------------------------
+# Input images (optional media)
+# ----------------------------
+inputs/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+
+# ----------------------------
+# Logs / temporary files
+# ----------------------------
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# ----------------------------
+# OS thumbnails / cache
+# ----------------------------
+ehthumbs.db
+Thumbs.db
